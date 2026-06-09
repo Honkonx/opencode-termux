@@ -1,0 +1,315 @@
+# Build OpenCode for Android — termux-ai-stack fork
+# 1. Clone upstream source → apply patches → bun build --compile
+# 2. Download Android Bun
+# 3. Wrap with bun-termux-loader (pre-built aarch64 wrapper)
+# 4. Package as .deb / .pkg.tar.xz
+# 5. Publish to GitHub Release (aarch64 only)
+
+name: Build OpenCode for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencode_ref:
+        description: "Upstream branch/tag (default: dev)"
+        required: false
+        default: "dev"
+      opencode_version:
+        description: "Version tag for output (e.g. 1.16.2) — vacío = auto desde package.json"
+        required: false
+        default: ""
+      publish_release:
+        description: "Publicar Release en GitHub (true/false)"
+        required: false
+        default: "true"
+
+env:
+  BUN_ANDROID_VER: "1.3.14"
+  BUN_TERMUX_LOADER_REPO: "https://github.com/Hope2333/bun-termux-loader"
+  FORK_OWNER: "Honkonx"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [aarch64]          # Solo ARM64 — x64 no aplica a Termux Android
+      fail-fast: false
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for aarch64
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
+
+      - name: Prepare directories
+        run: mkdir -p out/bundle out/status out/build
+
+      - name: Install Bun (Linux host)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # ── Resolver versión ──────────────────────────────────────
+      # Si el usuario no la pasó → leer desde package.json del upstream
+      - name: Resolve OpenCode version
+        id: resolve_version
+        run: |
+          INPUT_VER="${{ github.event.inputs.opencode_version }}"
+          if [ -n "$INPUT_VER" ]; then
+            echo "OPENCODE_VERSION=$INPUT_VER" >> $GITHUB_ENV
+            echo "version=$INPUT_VER" >> $GITHUB_OUTPUT
+          else
+            # Clonar solo para leer package.json (shallow, sin build)
+            git clone --depth 1 --branch "${{ github.event.inputs.opencode_ref || 'dev' }}" \
+              https://github.com/anomalyco/opencode.git /tmp/oc-probe 2>/dev/null || true
+            if [ -f "/tmp/oc-probe/packages/opencode/package.json" ]; then
+              VER=$(node -p "require('/tmp/oc-probe/packages/opencode/package.json').version" 2>/dev/null || echo "")
+            fi
+            [ -z "$VER" ] && VER="unknown"
+            echo "OPENCODE_VERSION=$VER" >> $GITHUB_ENV
+            echo "version=$VER" >> $GITHUB_OUTPUT
+            rm -rf /tmp/oc-probe
+          fi
+
+      - name: Clone upstream + apply patches
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ github.event.inputs.opencode_ref || 'dev' }}" \
+            https://github.com/anomalyco/opencode.git out/build/opencode-source 2>&1 || exit 1
+          cd out/build/opencode-source
+          if [[ -d "$GITHUB_WORKSPACE/patches" ]]; then
+            for p in "$GITHUB_WORKSPACE/patches/"*.patch; do
+              if [[ -f "$p" ]]; then
+                echo "Applying: $(basename $p)"
+                git apply "$p" 2>&1 || echo "Warning: patch failed (may already be applied)"
+              fi
+            done
+          fi
+
+      - name: Build OpenCode binary (linux-arm64)
+        run: |
+          set -euo pipefail
+          cd out/build/opencode-source
+          bun install 2>&1 | tail -3
+          cd packages/opencode
+          bun run build --target=linux-arm64 2>&1 | tail -10
+          BIN="$(find ../.. -name "opencode-linux-arm64" -type f 2>/dev/null | head -1 || true)"
+          if [[ -n "$BIN" ]]; then
+            cp "$BIN" "$GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64"
+            echo "Binary size: $(du -sh $GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64 | cut -f1)"
+            file "$GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64"
+          else
+            echo "ERROR: Binary not found after build"
+            ls -la dist/ 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Download Android Bun (aarch64)
+        continue-on-error: true
+        run: |
+          URL="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_ANDROID_VER/bun-linux-${{ matrix.arch }}-android.zip"
+          curl -fL "$URL" -o out/bundle/bun-android.zip || { echo "Bun Android download failed — skipping wrap"; exit 0; }
+          mkdir -p out/bun-tmp && unzip -o out/bundle/bun-android.zip -d out/bun-tmp/
+          B="$(find out/bun-tmp/ -name 'bun' -type f | head -1)"
+          if [[ -n "$B" ]]; then
+            cp "$B" out/bundle/bun-linux-android && chmod +x out/bundle/bun-linux-android
+            file out/bundle/bun-linux-android
+          fi
+          rm -rf out/bun-tmp
+
+      - name: Clone bun-termux-loader
+        run: |
+          git clone --depth 1 "$BUN_TERMUX_LOADER_REPO" out/build/loader 2>&1 || true
+          if [[ -f "out/build/loader/build.py" ]]; then echo "Loader ready"; fi
+
+      - name: Wrap binary for Android (Bionic/Termux)
+        run: |
+          set -euo pipefail
+          BIN="$(pwd)/out/bundle/opencode-linux-arm64"
+          LOADER="$(pwd)/out/build/loader"
+          if [[ ! -f "$BIN" || ! -f "$LOADER/build.py" ]]; then
+            echo "Binary or loader not available — skipping wrap" >&2
+            exit 0
+          fi
+          if [[ -f "tools/prebuilt/wrapper" && -f "tools/prebuilt/bunfs_shim.so" ]]; then
+            cp tools/prebuilt/wrapper "$LOADER/wrapper"
+            cp tools/prebuilt/bunfs_shim.so "$LOADER/bunfs_shim.so"
+            python3 "$LOADER/build.py" "$BIN" --wrapper "$LOADER/wrapper" --shim "$LOADER/bunfs_shim.so" 2>&1
+            TERMUX_BIN="${BIN}-termux"
+            if [[ -f "$TERMUX_BIN" ]]; then
+              cp "$TERMUX_BIN" out/bundle/opencode-termux-aarch64
+              file out/bundle/opencode-termux-aarch64
+            fi
+          else
+            echo "tools/prebuilt/ no disponible — se usará el binario sin wrap"
+          fi
+
+      # ── Empaquetar .pkg.tar.xz (formato Arch/Termux) ─────────
+      - name: Package as .pkg.tar.xz (Termux)
+        run: |
+          set -euo pipefail
+          VER="${OPENCODE_VERSION}"
+          PKGNAME="opencode"
+          PKGDIR="$(pwd)/out/pkg-termux"
+          mkdir -p "$PKGDIR/usr/bin" "$PKGDIR/usr/lib/opencode/runtime" "$PKGDIR/usr/share/opencode"
+
+          # Copiar binario principal
+          if [[ -f "out/bundle/opencode-termux-aarch64" ]]; then
+            cp out/bundle/opencode-termux-aarch64 "$PKGDIR/usr/bin/opencode"
+          elif [[ -f "out/bundle/opencode-linux-arm64" ]]; then
+            cp out/bundle/opencode-linux-arm64 "$PKGDIR/usr/bin/opencode"
+          else
+            echo "ERROR: no hay binario para empaquetar"; exit 1
+          fi
+          chmod 755 "$PKGDIR/usr/bin/opencode"
+
+          # Copiar runtime (bun android si existe)
+          if [[ -f "out/bundle/bun-linux-android" ]]; then
+            cp out/bundle/bun-linux-android "$PKGDIR/usr/lib/opencode/runtime/opencode"
+            chmod 755 "$PKGDIR/usr/lib/opencode/runtime/opencode"
+          fi
+
+          # PKGINFO — usando printf para evitar conflicto heredoc/YAML
+          SIZE=$(du -sb "$PKGDIR/usr" | cut -f1)
+          {
+            printf 'pkgname = %s\n' "$PKGNAME"
+            printf 'pkgver = %s-1\n' "$VER"
+            printf 'arch = aarch64\n'
+            printf 'size = %s\n' "$SIZE"
+            printf 'pkgdesc = OpenCode AI coding agent - Termux native ARM64\n'
+            printf 'url = https://github.com/%s/opencode-termux\n' "$FORK_OWNER"
+          } > "$PKGDIR/.PKGINFO"
+
+          # Crear tar.xz
+          cd "$PKGDIR"
+          OUTPUT="$(pwd)/../bundle/${PKGNAME}-${VER}-1-aarch64.pkg.tar.xz"
+          tar --numeric-owner -cJf "$OUTPUT" .PKGINFO usr/
+          echo "Package: $OUTPUT ($(du -sh $OUTPUT | cut -f1))"
+
+      # ── Empaquetar .deb ───────────────────────────────────────
+      - name: Package as .deb (Debian/Ubuntu)
+        run: |
+          set -euo pipefail
+          VER="${OPENCODE_VERSION}"
+          DEBDIR="$(pwd)/out/deb-work"
+          mkdir -p "$DEBDIR/DEBIAN" "$DEBDIR/usr/bin" "$DEBDIR/usr/lib/opencode/runtime"
+
+          if [[ -f "out/bundle/opencode-termux-aarch64" ]]; then
+            cp out/bundle/opencode-termux-aarch64 "$DEBDIR/usr/bin/opencode"
+          elif [[ -f "out/bundle/opencode-linux-arm64" ]]; then
+            cp out/bundle/opencode-linux-arm64 "$DEBDIR/usr/bin/opencode"
+          else
+            echo "ERROR: no hay binario para empaquetar"; exit 1
+          fi
+          chmod 755 "$DEBDIR/usr/bin/opencode"
+
+          if [[ -f "out/bundle/bun-linux-android" ]]; then
+            cp out/bundle/bun-linux-android "$DEBDIR/usr/lib/opencode/runtime/opencode"
+            chmod 755 "$DEBDIR/usr/lib/opencode/runtime/opencode"
+          fi
+
+          INSTALLED_SIZE=$(du -sk "$DEBDIR/usr" | cut -f1)
+          OC_REF="${{ github.event.inputs.opencode_ref || 'dev' }}"
+          # control debian — printf para evitar conflicto heredoc/YAML
+          {
+            printf 'Package: opencode\n'
+            printf 'Version: %s\n' "$VER"
+            printf 'Architecture: arm64\n'
+            printf 'Installed-Size: %s\n' "$INSTALLED_SIZE"
+            printf 'Maintainer: %s <noreply@github.com>\n' "$FORK_OWNER"
+            printf 'Description: OpenCode AI coding agent - Termux native ARM64\n'
+            printf ' Compilado desde anomalyco/opencode@%s\n' "$OC_REF"
+            printf ' Fork: https://github.com/%s/opencode-termux\n' "$FORK_OWNER"
+          } > "$DEBDIR/DEBIAN/control"
+
+          OUTPUT="$(pwd)/out/bundle/opencode_${VER}_aarch64.deb"
+          dpkg-deb --build "$DEBDIR" "$OUTPUT"
+          echo "Package: $OUTPUT ($(du -sh $OUTPUT | cut -f1))"
+
+      # ── Calcular checksums ────────────────────────────────────
+      - name: Generate checksums
+        run: |
+          cd out/bundle
+          sha256sum *.pkg.tar.xz *.deb 2>/dev/null > SHA256SUMS || true
+          cat SHA256SUMS
+
+      # ── Artifact temporal (30 días) ───────────────────────────
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-android-${{ matrix.arch }}
+          path: out/bundle/
+          retention-days: 30
+
+      # ── GitHub Release permanente ─────────────────────────────
+      - name: Publish GitHub Release
+        if: ${{ github.event.inputs.publish_release != 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.OPENCODE_VERSION }}
+          name: "OpenCode v${{ env.OPENCODE_VERSION }} — Android ARM64 (Termux native)"
+          body: |
+            ## OpenCode ${{ env.OPENCODE_VERSION }} — Termux native ARM64
+
+            Compilado desde [`anomalyco/opencode`](https://github.com/anomalyco/opencode) ref `${{ github.event.inputs.opencode_ref || 'dev' }}`.
+
+            ### Instalación (termux-ai-stack)
+            ```bash
+            bash install_opencode.sh
+            # El script detecta la versión más reciente automáticamente
+            ```
+
+            ### Instalación manual (.pkg.tar.xz — recomendado)
+            ```bash
+            pkg install glibc-repo && pkg update && pkg install glibc openssl-glibc
+            curl -fsSL https://github.com/Honkonx/opencode-termux/releases/latest/download/opencode-${{ env.OPENCODE_VERSION }}-1-aarch64.pkg.tar.xz \
+              -o opencode.pkg.tar.xz
+            tar -xJf opencode.pkg.tar.xz -C $PREFIX/
+            ```
+
+            ### Instalación manual (.deb)
+            ```bash
+            pkg install glibc-repo && pkg update && pkg install glibc openssl-glibc
+            curl -fsSL https://github.com/Honkonx/opencode-termux/releases/latest/download/opencode_${{ env.OPENCODE_VERSION }}_aarch64.deb \
+              -o opencode.deb
+            dpkg -i opencode.deb
+            ```
+
+            ### Dependencias requeridas en Termux
+            ```bash
+            pkg install glibc-repo
+            pkg update
+            pkg install glibc openssl-glibc
+            ```
+
+            ### Checksums
+            Ver `SHA256SUMS` adjunto.
+          files: |
+            out/bundle/opencode-${{ env.OPENCODE_VERSION }}-1-aarch64.pkg.tar.xz
+            out/bundle/opencode_${{ env.OPENCODE_VERSION }}_aarch64.deb
+            out/bundle/SHA256SUMS
+          make_latest: true
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Resumen del build ─────────────────────────────────────
+      - name: Write build status
+        if: always()
+        run: |
+          python3 -c "
+          import json, os
+          from pathlib import Path
+          bundle = Path('out/bundle')
+          assets = sorted([str(p.relative_to(Path('out'))) for p in bundle.rglob('*') if p.is_file()]) if bundle.exists() else []
+          Path('out/status/build-status.json').write_text(json.dumps({
+            'arch': '${{ matrix.arch }}',
+            'version': os.environ.get('OPENCODE_VERSION', 'unknown'),
+            'ref': '${{ github.event.inputs.opencode_ref || \"dev\" }}',
+            'status': 'completed',
+            'artifacts': assets,
+          }, indent=2)+'\n')
+          "
