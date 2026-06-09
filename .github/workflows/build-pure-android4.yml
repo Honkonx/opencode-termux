@@ -1,0 +1,258 @@
+# Build OpenCode for Android
+# 1. Clone upstream source → apply patches → bun build --compile
+# 2. Download Android Bun
+# 3. Wrap with bun-termux-loader (pre-built aarch64 wrapper)
+# 4. Package como .zip para artifact y release
+
+name: Build OpenCode for Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencode_ref:
+        description: "Upstream branch/tag (default: dev)"
+        required: false
+        default: "dev"
+      opencode_version:
+        description: "Version tag for output (e.g. 1.16.2) — vacío = auto desde package.json"
+        required: false
+        default: ""
+      publish_release:
+        description: "Publicar Release en GitHub (true/false)"
+        required: false
+        default: "true"
+
+env:
+  BUN_ANDROID_VER: "1.3.14"
+  BUN_TERMUX_LOADER_REPO: "https://github.com/Hope2333/bun-termux-loader"
+  FORK_OWNER: "Honkonx"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [aarch64, x64]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU for aarch64
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64 2>/dev/null || true
+
+      - name: Prepare directories
+        run: mkdir -p out/bundle out/status out/build
+
+      - name: Install Bun (Linux)
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Clone upstream + apply patches
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ github.event.inputs.opencode_ref || 'dev' }}" \
+            https://github.com/anomalyco/opencode.git out/build/opencode-source 2>&1 || exit 1
+          cd out/build/opencode-source
+          if [[ -d "$GITHUB_WORKSPACE/patches" ]]; then
+            for p in "$GITHUB_WORKSPACE/patches/"*.patch; do
+              if [[ -f "$p" ]]; then
+                echo "Applying: $(basename $p)"
+                git apply "$p" 2>&1 || echo "Warning: patch failed (may already be applied)"
+              fi
+            done
+          fi
+
+      # Resolver versión desde package.json si no se pasó como input
+      - name: Resolve OpenCode version
+        run: |
+          INPUT_VER="${{ github.event.inputs.opencode_version }}"
+          if [ -n "$INPUT_VER" ]; then
+            echo "OPENCODE_VERSION=$INPUT_VER" >> $GITHUB_ENV
+          else
+            PKG="out/build/opencode-source/packages/opencode/package.json"
+            if [ -f "$PKG" ]; then
+              VER=$(node -p "require('./$PKG').version" 2>/dev/null || echo "")
+            fi
+            [ -z "${VER:-}" ] && VER="unknown"
+            echo "OPENCODE_VERSION=$VER" >> $GITHUB_ENV
+          fi
+
+      - name: Build OpenCode binary
+        run: |
+          set -euo pipefail
+          cd out/build/opencode-source
+          bun install 2>&1 | tail -3
+          cd packages/opencode
+          bun run build --target=linux-arm64 2>&1 | tail -10
+
+          # El build produce un DIRECTORIO dist/opencode-linux-arm64/
+          # con el binario 'opencode' dentro — NO un archivo plano
+          DIST_DIR="$(find ../.. -maxdepth 5 -type d -name "opencode-linux-arm64" 2>/dev/null | head -1 || true)"
+          if [[ -n "$DIST_DIR" ]]; then
+            # Buscar el ejecutable dentro del directorio
+            BIN="$(find "$DIST_DIR" -maxdepth 2 -type f -executable 2>/dev/null | head -1 || true)"
+            # Fallback: cualquier archivo en el directorio
+            [[ -z "$BIN" ]] && BIN="$(find "$DIST_DIR" -maxdepth 2 -type f 2>/dev/null | grep -v '\.map$' | head -1 || true)"
+            if [[ -n "$BIN" ]]; then
+              cp "$BIN" "$GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64"
+              chmod +x "$GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64"
+              echo "Binary found: $BIN"
+              echo "Binary size: $(du -sh $GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64 | cut -f1)"
+              file "$GITHUB_WORKSPACE/out/bundle/opencode-linux-arm64"
+            else
+              echo "ERROR: No executable found inside $DIST_DIR"
+              ls -la "$DIST_DIR" || true
+              exit 1
+            fi
+          else
+            echo "ERROR: dist directory opencode-linux-arm64 not found"
+            echo "Contents of dist/:"
+            ls -la dist/ 2>/dev/null || true
+            echo "Full search:"
+            find ../.. -maxdepth 6 -name "opencode*" 2>/dev/null | head -20 || true
+            exit 1
+          fi
+
+      - name: Download Android Bun for ${{ matrix.arch }}
+        continue-on-error: true
+        run: |
+          URL="https://github.com/oven-sh/bun/releases/download/bun-v$BUN_ANDROID_VER/bun-linux-${{ matrix.arch }}-android.zip"
+          curl -fL "$URL" -o out/bundle/bun-android.zip || exit 0
+          mkdir -p out/bun-tmp && unzip -o out/bundle/bun-android.zip -d out/bun-tmp/
+          B="$(find out/bun-tmp/ -name 'bun' -type f | head -1)"
+          if [[ -n "$B" ]]; then
+            cp "$B" out/bundle/bun-linux-android && chmod +x out/bundle/bun-linux-android
+            file out/bundle/bun-linux-android
+          fi
+          rm -rf out/bun-tmp
+
+      - name: Clone bun-termux-loader
+        run: |
+          git clone --depth 1 "$BUN_TERMUX_LOADER_REPO" out/build/loader 2>&1 || true
+          if [[ -f "out/build/loader/build.py" ]]; then echo "Loader ready"; fi
+
+      - name: Wrap for Android
+        run: |
+          set -euo pipefail
+          BIN="$(pwd)/out/bundle/opencode-linux-arm64"
+          LOADER="$(pwd)/out/build/loader"
+          if [[ ! -f "$BIN" || ! -f "$LOADER/build.py" ]]; then
+            echo "Binary or loader not available, skipping wrap" >&2
+            exit 0
+          fi
+          if [[ -f "tools/prebuilt/wrapper" && -f "tools/prebuilt/bunfs_shim.so" ]]; then
+            cp tools/prebuilt/wrapper "$LOADER/wrapper"
+            cp tools/prebuilt/bunfs_shim.so "$LOADER/bunfs_shim.so"
+            python3 "$LOADER/build.py" "$BIN" --wrapper "$LOADER/wrapper" --shim "$LOADER/bunfs_shim.so" 2>&1
+            TERMUX_BIN="${BIN}-termux"
+            if [[ -f "$TERMUX_BIN" ]]; then
+              cp "$TERMUX_BIN" out/bundle/opencode-termux-aarch64
+              file out/bundle/opencode-termux-aarch64
+            fi
+          else
+            echo "tools/prebuilt/ not available — binary will be used as-is"
+          fi
+
+      # Empaquetar como zip para release (evita heredocs y dpkg-deb)
+      - name: Package as zip
+        run: |
+          set -euo pipefail
+          VER="${OPENCODE_VERSION}"
+          ARCH="${{ matrix.arch }}"
+
+          # Usar binario wrapeado si existe, sino el raw
+          if [[ -f "out/bundle/opencode-termux-aarch64" ]]; then
+            FINAL_BIN="out/bundle/opencode-termux-aarch64"
+          elif [[ -f "out/bundle/opencode-linux-arm64" ]]; then
+            FINAL_BIN="out/bundle/opencode-linux-arm64"
+          else
+            echo "No binary to package"; exit 0
+          fi
+
+          PKG_DIR="out/pkg-${ARCH}"
+          mkdir -p "${PKG_DIR}/usr/bin" "${PKG_DIR}/usr/lib/opencode/runtime"
+          cp "$FINAL_BIN" "${PKG_DIR}/usr/bin/opencode"
+          chmod 755 "${PKG_DIR}/usr/bin/opencode"
+
+          if [[ -f "out/bundle/bun-linux-android" ]]; then
+            cp "out/bundle/bun-linux-android" "${PKG_DIR}/usr/lib/opencode/runtime/opencode"
+            chmod 755 "${PKG_DIR}/usr/lib/opencode/runtime/opencode"
+          fi
+
+          cd "${PKG_DIR}"
+          zip -r "../bundle/opencode-android-${ARCH}-${VER}.zip" usr/
+          cd -
+          echo "Package: out/bundle/opencode-android-${ARCH}-${VER}.zip"
+          ls -lh "out/bundle/opencode-android-${ARCH}-${VER}.zip"
+
+      - name: Generate checksums
+        run: |
+          cd out/bundle
+          sha256sum *.zip opencode-linux-arm64 opencode-termux-aarch64 2>/dev/null > SHA256SUMS || true
+          cat SHA256SUMS
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-android-${{ matrix.arch }}
+          path: out/bundle/
+          retention-days: 30
+
+      # Release solo para aarch64 — x64 solo sube artifact
+      - name: Publish GitHub Release
+        if: ${{ matrix.arch == 'aarch64' && github.event.inputs.publish_release != 'false' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.OPENCODE_VERSION }}
+          name: "OpenCode v${{ env.OPENCODE_VERSION }} — Android ARM64 (Termux native)"
+          body: |
+            ## OpenCode ${{ env.OPENCODE_VERSION }} — Termux native ARM64
+
+            Compilado desde [`anomalyco/opencode`](https://github.com/anomalyco/opencode) ref `${{ github.event.inputs.opencode_ref || 'dev' }}`.
+
+            ### Instalación automática (termux-ai-stack)
+            ```bash
+            bash install_opencode.sh
+            ```
+
+            ### Instalación manual
+            ```bash
+            pkg install glibc-repo && pkg update && pkg install glibc openssl-glibc
+            curl -fsSL https://github.com/Honkonx/opencode-termux/releases/latest/download/opencode-android-aarch64-${{ env.OPENCODE_VERSION }}.zip \
+              -o opencode.zip
+            unzip opencode.zip -d $PREFIX/
+            ```
+
+            ### Checksums
+            Ver `SHA256SUMS` adjunto.
+          files: |
+            out/bundle/opencode-android-aarch64-${{ env.OPENCODE_VERSION }}.zip
+            out/bundle/opencode-termux-aarch64
+            out/bundle/SHA256SUMS
+          make_latest: true
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write status
+        if: always()
+        env:
+          BUILD_ARCH: ${{ matrix.arch }}
+          BUILD_REF: ${{ github.event.inputs.opencode_ref || 'dev' }}
+        run: |
+          python3 -c "
+          import json, os
+          from pathlib import Path
+          bundle = Path('out/bundle')
+          assets = sorted([str(p.relative_to(Path('out'))) for p in bundle.rglob('*') if p.is_file()]) if bundle.exists() else []
+          Path('out/status/build-status.json').write_text(json.dumps({
+            'arch': os.environ.get('BUILD_ARCH', 'unknown'),
+            'version': os.environ.get('OPENCODE_VERSION', 'unknown'),
+            'ref': os.environ.get('BUILD_REF', 'dev'),
+            'status': 'completed',
+            'artifacts': assets,
+          }, indent=2)+'\n')
+          "
