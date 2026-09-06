@@ -1,0 +1,67 @@
+# PKGBUILD for OpenCode Native (transplant revival line) on Termux
+# Built via scripts/package/package_pacman_native.sh (pkgver/pkgrel rewritten there).
+pkgname=opencode
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='OpenCode native Android runtime for Termux (stable mainline since 27/28, full TUI; glibc appendix is opencode-glibc)'
+arch=('aarch64')
+url='https://github.com/anomalyco/opencode'
+license=('MIT')
+options=('!strip' '!debug')
+
+depends=()
+# NOTE: no conflict on the literal 'opencode-glibc' name: opencode-glibc-standalone
+# provides that virtual name and MUST coexist with us. Mutual exclusion with the
+# real glibc package is enforced by its own conflicts=('opencode' ...) list.
+conflicts=('opencode-compressed')
+replaces=()
+
+source=()
+sha256sums=()
+
+# Location of the revived native binary, injected by the packaging script.
+: "${OPENCODE_NATIVE_BIN:?OPENCODE_NATIVE_BIN must point to opencode-native-revived}"
+
+package() {
+    if [[ -z "$OPENCODE_NATIVE_BIN" || ! -f "$OPENCODE_NATIVE_BIN" ]]; then
+        error "OPENCODE_NATIVE_BIN not set or missing"
+        return 1
+    fi
+
+    msg "Installing native runtime from $OPENCODE_NATIVE_BIN"
+    # FIX: stage to $pkgdir/usr/ (NOT $pkgdir$prefix/) so tarball paths are
+    # usr/bin/opencode — avoids double-prefix on `pacman -U` install (RootDir
+    # /data/data/com.termux/files + usr/bin/opencode = correct single-prefix).
+    mkdir -p "$pkgdir/usr/bin"
+    install -m755 "$OPENCODE_NATIVE_BIN" "$pkgdir/usr/bin/opencode"
+
+    # W11: ship the self-activating seccomp shim when the binary references it
+    # (DT_NEEDED libopencode-crhandler.so). It must land in usr/lib/opencode/
+    # to satisfy the binary's DT_RUNPATH $ORIGIN/../lib/opencode.
+    if grep -aqF libopencode-crhandler.so "$OPENCODE_NATIVE_BIN"; then
+        local shim_so
+        shim_so="$(dirname "$OPENCODE_NATIVE_BIN")/libopencode-crhandler.so"
+        if [[ ! -f "$shim_so" ]]; then
+            error "hardened binary references libopencode-crhandler.so but $shim_so is missing (run: make seccomp-harden)"
+            return 1
+        fi
+        mkdir -p "$pkgdir/usr/lib/opencode"
+        install -m644 "$shim_so" "$pkgdir/usr/lib/opencode/libopencode-crhandler.so"
+        msg "Packaging seccomp shim: $shim_so -> usr/lib/opencode/"
+    else
+        msg "binary is not seccomp-hardened; shipping without libopencode-crhandler.so"
+    fi
+}
+
+post_install() {
+    echo ""
+    echo "OpenCode Native installed (stable mainline since 27/28)"
+    echo "Usage: opencode --version"
+    echo "Scope: full TUI and run/serve. Stable mainline since 27/28."
+    echo "Requires Android API >= 28; zero glibc runtime deps."
+    echo "Glibc appendix alternative: package 'opencode-glibc'."
+}
+
+post_upgrade() {
+    post_install
+}

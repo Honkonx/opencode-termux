@@ -30,8 +30,8 @@ fi
 cd "$ROOT_DIR/packing/pacman"
 rm -rf "$ROOT_DIR/packing/pacman/pkg" "$ROOT_DIR/packing/pacman/src"
 
-TMP_MAKEPKG_CONF="$ROOT_DIR/packing/pacman/.makepkg-opencode.conf"
-TMP_PKGBUILD="$ROOT_DIR/packing/pacman/.PKGBUILD.opencode.tmp"
+TMP_MAKEPKG_CONF="$ROOT_DIR/packing/pacman/.makepkg-opencode-glibc.conf"
+TMP_PKGBUILD="$ROOT_DIR/packing/pacman/.PKGBUILD.opencode-glibc.tmp"
 cleanup() {
 	rm -f "$TMP_MAKEPKG_CONF" "$TMP_PKGBUILD"
 }
@@ -47,3 +47,15 @@ sed -i "s/^pkgrel=.*/pkgrel=$PKGREL/" "$TMP_PKGBUILD"
 STAGED_PREFIX="$STAGED_PREFIX" REPO_ROOT="$ROOT_DIR" makepkg --config "$TMP_MAKEPKG_CONF" -f --noconfirm -p "$TMP_PKGBUILD"
 
 echo "Pacman package created under: $ROOT_DIR/packing/pacman"
+
+# --- Regression guard: reject packages with data/ payload paths (double-prefix bug) ---
+BUILT_PKG=$(ls "$ROOT_DIR/packing/pacman/opencode-glibc-${VERSION}-${PKGREL}-aarch64.pkg.tar.xz" 2>/dev/null || true)
+if [[ -n "$BUILT_PKG" ]]; then
+    DATA_PAYLOAD=$(bsdtar -tf "$BUILT_PKG" | grep -E '^data/.*/(bin|lib)/' | head -1 || true)
+    if [[ -n "$DATA_PAYLOAD" ]]; then
+        echo "FATAL: regression guard triggered — found data/ payload path: $DATA_PAYLOAD" >&2
+        echo "Ensure PKGBUILD stages to \$pkgdir/usr/ (relative), not \$pkgdir\$prefix." >&2
+        exit 1
+    fi
+    echo "Regression guard: OK (no data/ payload paths)"
+fi

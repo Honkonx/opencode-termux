@@ -4,7 +4,7 @@
 **Branch:** pure-android
 
 ## OVERVIEW
-Termux-first OpenCode build/packaging workspace. Mainline release path is local Termux build (`tools/produce-local.sh` + `scripts/*`), while GitHub Actions armv7 workflow is diagnostic/handoff, not final runtime release.
+Termux-first OpenCode build/packaging workspace. Stable mainline since 27/28 is the native bionic line: a single zero-glibc Android ELF produced by the transplant revive pipeline (`tools/transplant/`, `make transplant`; see `docs/transplant.md`). The glibc wrapper line is renamed `opencode-glibc` and demoted to appendix maintenance (local build path `tools/produce-local.sh` + `scripts/*`); `opencode-glibc-standalone` is the frozen single-version rollback package that can coexist with `opencode`. `opencode` and `opencode-glibc` remain mutually exclusive. GitHub Actions workflows are diagnostic/handoff, not final runtime release.
 
 ## STRUCTURE
 ```text
@@ -13,7 +13,7 @@ opencode-termux/
 ├── scripts/                    # staging, packaging, hook runners, CI helper scripts
 ├── tools/                      # operator-facing CLIs (make wrapper, plugin lifecycle, matrix)
 ├── packing/                  # package templates + manifests (mixed with generated outputs)
-├── docs/                       # canonical runbooks, architecture notes, incident records
+├── docs/                       # canonical runbooks, architecture notes, incident records (e.g. docs/transplant.md)
 ├── artifacts/                  # generated runtime/staging outputs (disposable)
 └── .github/workflows/          # CI handoff workflows
 ```
@@ -24,11 +24,14 @@ opencode-termux/
 | Build orchestration | `Makefile`, `tools/make-opencode` | `make` is source of truth; wrapper maps CLI flags to make vars |
 | Prepare runtime artifact | `tools/produce-local.sh` | resolves version, wraps runtime, cleans stale generated dirs |
 | Stage install tree | `scripts/build.sh`, `scripts/common.sh` | writes staged prefix + build metadata |
-| Build DEB package | `scripts/package/package_deb.sh`, `packing/deb/DEBIAN/control` | postinst hook calls system-skill runner |
-| Build pacman package | `scripts/package/package_pacman.sh`, `packing/pacman/PKGBUILD*` | dynamic pkgver/pkgrel rewrite + makepkg flow |
+| Build DEB package (glibc appendix) | `scripts/package/package_deb.sh`, `packing/deb/DEBIAN/control` | builds the `opencode-glibc` deb; postinst hook calls system-skill runner |
+| Build pacman package (glibc appendix) | `scripts/package/package_pacman.sh`, `packing/pacman/PKGBUILD*` | builds the `opencode-glibc` pacman package; dynamic pkgver/pkgrel rewrite + makepkg flow |
+| Native provider packaging | `scripts/package/package_deb_native.sh`, `scripts/package/package_pacman_native.sh`, `packing/pacman/PKGBUILD.native` | `opencode-native` deb/pacman providers for the native bionic mainline (stable since 27/28; see docs/dual-track-install.md) |
+| Standalone rollback packaging | `scripts/package/package_deb_standalone.sh`, `scripts/package/package_pacman_standalone.sh`, `packing/pacman/PKGBUILD.standalone` | `opencode-glibc-standalone` frozen rollback package (coexists with `opencode`); stage via `STANDALONE=1 ./scripts/build.sh` |
 | System-skill hook behavior | `scripts/hooks/run-system-skills.sh`, `packing/manifests/system-skills/*.json` | strict/network flags default to safe mode |
 | Plugin lifecycle | `tools/plugin-manager.sh`, `tools/plugin-selfcheck.sh`, `docs/plugin-management.md` | local file plugin path + snapshot rollback model |
 | Upgrade/downgrade simulation | `tools/upgrade-matrix.sh`, `docs/execution-checklist.md` | machine2 lifecycle validation with cached deb artifacts |
+| Transplant 管线 | `tools/transplant/transplant.py` | 原生 android Bun 拼接 + ELF 复活手术（C1 已复活，见 `docs/transplant.md`） |
 | CI armv7 handoff | `.github/workflows/prebuild-armv7.yml`, `scripts/ci/*` | attempt-based build evidence, not final Termux release path |
 
 ## CODE MAP
