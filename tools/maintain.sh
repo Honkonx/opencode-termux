@@ -886,43 +886,51 @@ cmd_clear() {
 }
 
 # ─────────────────────────────── sync-db ──────────────────────────────────────
-# Refresh the unified hope2333.db.tar.gz on all 5 release CDNs: fetch the
-# CI-built db from the Pages fallback (canonical), sanity-check, clobber-upload.
+# Refresh the unified hope2333.db{,.tar.gz} on all 5 release CDNs: fetch the
+# CI-built db from the Pages fallback (canonical), sanity-check, clobber-upload
+# BOTH names — pacman fetches <repo>.db (uncompressed name), so shipping only
+# the .tar.gz name made every github CDN 404 on -Sy and fall through to Pages.
 # MiMoCode pinned to Push260829 (prerelease channel — GitHub forbids prerelease
 # Latest); the other four resolve latest at runtime (future-proof vs tag churn).
 cmd_sync_db() {
-	local tmp n r t fail=0
+	local tmp tmpraw n r t fail=0
 	tmp="${TMPDIR:-/tmp}/hope2333.db.tar.gz"
+	tmpraw="${TMPDIR:-/tmp}/hope2333.db"
 	if [ "$DRY" = 1 ]; then
-		dry "curl -fsSL 'https://hope2333.github.io/repo/Termux/pacman/hope2333.db.tar.gz' -> $tmp (expect >=8 entries)"
-		dry "gh release upload <tag> -R Hope2333/<repo> $tmp --clobber  (5 repos: 4 latest-resolved + MiMoCode@Push260829)"
+		dry "curl -fsSL 'https://hope2333.github.io/repo/Termux/pacman/hope2333.db{,.tar.gz}' -> $tmp $tmpraw (expect >=9 entries)"
+		dry "gh release upload <tag> -R Hope2333/<repo> $tmp $tmpraw --clobber  (5 repos: 4 latest-resolved + MiMoCode@Push260829)"
 		return 0
 	fi
-	log "fetch unified db from Pages fallback"
+	log "fetch unified db (both names) from Pages fallback"
 	curl -fsSL "https://hope2333.github.io/repo/Termux/pacman/hope2333.db.tar.gz?v=$(date +%s)" -o "$tmp" \
 		|| die "fetch unified db from Pages failed"
+	curl -fsSL "https://hope2333.github.io/repo/Termux/pacman/hope2333.db?v=$(date +%s)" -o "$tmpraw" \
+		|| die "fetch unified db (raw name) from Pages failed"
 	n=$(tar -tzf "$tmp" 2>/dev/null | grep -c '/desc$' || true)
-	[ "${n:-0}" -ge 8 ] || die "unified db looks wrong (entries=${n:-0}, expect >=8) — refusing to publish"
+	# floor 9: opencode + opencode-glibc + opencode-compressed +
+	# opencode-glibc-standalone + mimocode + mimocode-glibc + codegraph +
+	# freebuff + codebuff — refuse to publish a regressed db
+	[ "${n:-0}" -ge 9 ] || die "unified db looks wrong (entries=${n:-0}, expect >=9) — refusing to publish"
 	log "unified db OK: ${n} entries, $(wc -c <"$tmp") bytes"
 	local repos=(codegraph-termux opencode-termux freebuff-termux codebuff-termux)
 	for r in "${repos[@]}"; do
 		t=$(gh api "repos/Hope2333/$r/releases/latest" --jq .tag_name) \
 			|| { echo "Error: resolve latest failed: $r" >&2; fail=1; continue; }
-		if gh release upload "$t" -R "Hope2333/$r" "$tmp" --clobber >/dev/null 2>&1; then
-			log "synced hope2333.db.tar.gz -> $r@$t"
+		if gh release upload "$t" -R "Hope2333/$r" "$tmp" "$tmpraw" --clobber >/dev/null 2>&1; then
+			log "synced hope2333.db{,.tar.gz} -> $r@$t"
 		else
 			echo "Error: sync failed -> $r@$t" >&2
 			fail=1
 		fi
 	done
 	t="Push260829"
-	if gh release upload "$t" -R "Hope2333/MiMoCode-Termux" "$tmp" --clobber >/dev/null 2>&1; then
-		log "synced hope2333.db.tar.gz -> MiMoCode-Termux@$t"
+	if gh release upload "$t" -R "Hope2333/MiMoCode-Termux" "$tmp" "$tmpraw" --clobber >/dev/null 2>&1; then
+		log "synced hope2333.db{,.tar.gz} -> MiMoCode-Termux@$t"
 	else
 		echo "Error: sync failed -> MiMoCode-Termux@$t" >&2
 		fail=1
 	fi
-	rm -f "$tmp"
+	rm -f "$tmp" "$tmpraw"
 	[ "$fail" -eq 0 ] || die "sync-db finished with failures"
 	log "sync-db complete: unified db refreshed on 5 release CDNs"
 }
