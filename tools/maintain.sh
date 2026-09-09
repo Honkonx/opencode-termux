@@ -892,12 +892,16 @@ cmd_clear() {
 # the .tar.gz name made every github CDN 404 on -Sy and fall through to Pages.
 # MiMoCode pinned to Push260829 (prerelease channel — GitHub forbids prerelease
 # Latest); the other four resolve latest at runtime (future-proof vs tag churn).
+# NOTE: the hope2333-mirrorlist pkg files are NOT uploaded here — site.yml's
+# publish step owns pkg distribution (db + pkg uploaded atomically per CI run),
+# so the pkg matching this db is already on every CDN from the same run; this
+# manual path intentionally re-distributes the CI-published db only.
 cmd_sync_db() {
 	local tmp tmpraw n r t fail=0
 	tmp="${TMPDIR:-/tmp}/hope2333.db.tar.gz"
 	tmpraw="${TMPDIR:-/tmp}/hope2333.db"
 	if [ "$DRY" = 1 ]; then
-		dry "curl -fsSL 'https://hope2333.github.io/repo/Termux/pacman/hope2333.db{,.tar.gz}' -> $tmp $tmpraw (expect >=9 entries)"
+		dry "curl -fsSL 'https://hope2333.github.io/repo/Termux/pacman/hope2333.db{,.tar.gz}' -> $tmp $tmpraw (expect >=10 entries)"
 		dry "gh release upload <tag> -R Hope2333/<repo> $tmp $tmpraw --clobber  (5 repos: 4 latest-resolved + MiMoCode@Push260829)"
 		return 0
 	fi
@@ -907,10 +911,11 @@ cmd_sync_db() {
 	curl -fsSL "https://hope2333.github.io/repo/Termux/pacman/hope2333.db?v=$(date +%s)" -o "$tmpraw" \
 		|| die "fetch unified db (raw name) from Pages failed"
 	n=$(tar -tzf "$tmp" 2>/dev/null | grep -c '/desc$' || true)
-	# floor 9: opencode + opencode-glibc + opencode-compressed +
+	# floor 10: opencode + opencode-glibc + opencode-compressed +
 	# opencode-glibc-standalone + mimocode + mimocode-glibc + codegraph +
-	# freebuff + codebuff — refuse to publish a regressed db
-	[ "${n:-0}" -ge 9 ] || die "unified db looks wrong (entries=${n:-0}, expect >=9) — refusing to publish"
+	# freebuff + codebuff + hope2333-mirrorlist — refuse to publish a
+	# regressed db
+	[ "${n:-0}" -ge 10 ] || die "unified db looks wrong (entries=${n:-0}, expect >=10) — refusing to publish"
 	log "unified db OK: ${n} entries, $(wc -c <"$tmp") bytes"
 	local repos=(codegraph-termux opencode-termux freebuff-termux codebuff-termux)
 	for r in "${repos[@]}"; do
